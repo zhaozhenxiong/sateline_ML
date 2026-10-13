@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sateline-ml"
+version = "0.1.0"
+description = "Portable Sentinel-2 download and floating debris detection pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.scripts]
+sateline = "sateline_ml.cli:main"
+
+[project.optional-dependencies]
+download = [
+    "earthengine-api>=0.1.390",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "rasterio>=1.3",
+    "requests>=2.31",
+]
+detection = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "rasterio>=1.3",
+    "geopandas>=0.14",
+    "shapely>=2.0",
+    "torch>=2.2",
+    "opencv-python-headless>=4.8",
+    "matplotlib>=3.7",
+    "tqdm>=4.66",
+]
+all = [
+    "earthengine-api>=0.1.390",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "rasterio>=1.3",
+    "requests>=2.31",
+    "geopandas>=0.14",
+    "shapely>=2.0",
+    "torch>=2.2",
+    "opencv-python-headless>=4.8",
+    "matplotlib>=3.7",
+    "tqdm>=4.66",
+]
+stacking = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "opencv-python-headless>=4.8",
+    "scikit-learn>=1.3",
+    "scikit-image>=0.21",
+    "lightgbm>=4.0",
+    "xgboost>=2.0",
+    "catboost>=1.2",
+]
+# Optional CRF requires a compiler on platforms without a matching wheel.
+crf = ["pydensecrf>=1.0rc3"]
+dev = ["pytest>=8", "build>=1.2"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["sateline_ml", "sateline_ml.*"]
+exclude = ["attic*", "scripts*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

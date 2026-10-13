@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -321,15 +321,41 @@ def predict_plastic(model: PlasticMLP, features: np.ndarray, *, device: Optional
 def save_plastic_model(path: Path | str, model: PlasticMLP, metadata: PlasticModelMetadata) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state_dict": model.state_dict(), "metadata": metadata}, path)
+    linear_layers = [layer for layer in model.net if isinstance(layer, nn.Linear)]
+    dropout = next((layer.p for layer in model.net if isinstance(layer, nn.Dropout)), 0.0)
+    torch.save({
+        "state_dict": model.state_dict(),
+        "metadata": asdict(metadata),
+        "architecture": {"hidden": [layer.out_features for layer in linear_layers[:-1]], "dropout": dropout},
+    }, path)
 
 
 def load_plastic_model(path: Path | str, *, device: Optional[str] = None) -> Tuple[PlasticMLP, PlasticModelMetadata]:
     load_device = resolve_device(device)
-    checkpoint = torch.load(path, map_location=load_device)
-    metadata = PlasticModelMetadata(**checkpoint["metadata"])
-    model = PlasticMLP(metadata.input_dim)
-    model.load_state_dict(checkpoint["state_dict"])
+    # Legacy files stored this known metadata dataclass. Allow only that class
+    # while retaining Torch's restricted checkpoint loader on recent versions.
+    if hasattr(torch.serialization, "safe_globals"):
+        with torch.serialization.safe_globals([PlasticModelMetadata]):
+            checkpoint = torch.load(path, map_location=load_device, weights_only=True)
+    else:  # Compatibility with Torch versions predating the restricted loader.
+        checkpoint = torch.load(path, map_location=load_device)
+    raw_metadata = checkpoint["metadata"]
+    metadata = raw_metadata if isinstance(raw_metadata, PlasticModelMetadata) else PlasticModelMetadata(**raw_metadata)
+    state_dict = checkpoint["state_dict"]
+    architecture = checkpoint.get("architecture")
+    if architecture is None:
+        # Existing checkpoints used different hidden widths without saving an
+        # architecture. Linear weight tensors describe those widths exactly.
+        weights = sorted(
+            ((int(key.split(".")[1]), value) for key, value in state_dict.items()
+             if key.startswith("net.") and key.endswith(".weight") and value.ndim == 2),
+            key=lambda item: item[0],
+        )
+        if not weights or weights[0][1].shape[1] != metadata.input_dim or weights[-1][1].shape[0] != 1:
+            raise ValueError("Plastic checkpoint weights do not match metadata.input_dim or a binary classifier")
+        architecture = {"hidden": [int(weight.shape[0]) for _, weight in weights[:-1]], "dropout": 0.0}
+    model = PlasticMLP(metadata.input_dim, hidden=architecture["hidden"], dropout=architecture.get("dropout", 0.0))
+    model.load_state_dict(state_dict)
     model.to(load_device)
     model.eval()
     return model, metadata

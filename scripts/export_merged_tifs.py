@@ -1,35 +1,34 @@
-"""Copy merged Sentinel-2 products into a flat directory."""
+"""Copy current and legacy merged Sentinel-2 products into a flat directory."""
 
 from __future__ import annotations
 
 import argparse
-import shutil
+import logging
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sateline_ml.workflows import export_merged_tifs
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root_dir", help="Directory containing per-date folders with 2merged_tif subdirectories")
+    parser.add_argument("root_dir", help="Download root with 2merged_tif or legacy merge_<date> directories")
     parser.add_argument("export_dir", help="Destination directory for flattened exports")
-    args = parser.parse_args()
-
-    root_dir = Path(args.root_dir)
-    export_dir = Path(args.export_dir)
-    export_dir.mkdir(parents=True, exist_ok=True)
-
-    for date_dir in sorted(root_dir.iterdir()):
-        if not date_dir.is_dir():
-            continue
-        merged_dir = date_dir / "2merged_tif"
-        if not merged_dir.exists():
-            continue
-        for tif in merged_dir.glob("*.tif"):
-            dst = export_dir / f"{date_dir.name}_{tif.name}"
-            shutil.copy2(tif, dst)
-            print(f"✅ {tif} -> {dst}")
-
-    print(f"\n🎉 Export complete: {export_dir}")
+    parser.add_argument("--scene-prefix", help="Optional lake ID prefix for matching scene TIFFs to shapefiles")
+    parser.add_argument("--overwrite", action="store_true", help="Replace existing exports with different contents")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    try:
+        products = export_merged_tifs(
+            args.root_dir, args.export_dir, scene_prefix=args.scene_prefix, overwrite=args.overwrite
+        )
+    except (ValueError, OSError) as exc:
+        parser.exit(1, f"Export failed: {exc}\n")
+    print(f"Export complete: {len(products)} scene products in {args.export_dir}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

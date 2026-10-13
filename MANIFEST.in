@@ -1,0 +1,18 @@
+include LICENSE README.md AGENTS.md
+include pipeline.example.json run_pipeline.py
+recursive-include scripts *.py
+recursive-include tests *.py
+prune attic
+prune mydata
+prune gee_sentinel3
+prune gee_nature3
+prune target
+prune target_merge
+prune target_n
+prune spectral_library
+prune HydroLAKES_polys_v10.gdb
+prune HydroLAKES_polys_v10_shp
+prune lake_01-05
+prune .venv
+prune .git
+global-exclude *.tif *.tiff *.csv *.pt *.pth *.gdb ._* *.pyc

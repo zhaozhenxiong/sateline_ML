@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -194,8 +196,32 @@ def robust_download_band(img, band, out_path, region, nx=1, ny=1):
     return False
 
 
+def _band_paths(folder: Path, band: str) -> list[Path]:
+    """Find a band's original files without confusing B8 with B8A.
+
+    Reprojected intermediates are excluded so repeat merges do not mosaic the
+    same tile twice.
+    """
+    pattern = re.compile(rf"{re.escape(band)}(?:_tile\d+)?\.(?:tif|tiff)", re.IGNORECASE)
+    return sorted(path for path in folder.iterdir() if path.is_file() and pattern.fullmatch(path.name))
+
+
+def _validate_band_order(bands: Sequence[str]) -> tuple[str, ...]:
+    from .workflows import SENTINEL2_BANDS
+
+    if isinstance(bands, (str, bytes)):
+        raise ValueError("bands must be a sequence of unique Sentinel-2 band names")
+    try:
+        band_order = tuple(bands)
+        if not band_order or len(set(band_order)) != len(band_order) or any(b not in SENTINEL2_BANDS for b in band_order):
+            raise ValueError
+    except (ValueError, TypeError) as exc:
+        raise ValueError("bands must be a sequence of unique Sentinel-2 band names") from exc
+    return band_order
+
+
 def all_bands_downloaded(folder: Path, bands: Sequence[str]) -> bool:
-    return all(list(folder.glob(f"{band}*.tif")) for band in bands)
+    return all(_band_paths(folder, band) for band in bands)
 
 
 
@@ -207,10 +233,12 @@ def _read_mosaic(paths: list[Path]):
         return mosaic[0].astype(np.float32), out_trans, ds[0].crs
 
 def merge_bands(src_folder: Path, out_path: Path, bands: Sequence[str]) -> Path:
+    bands = _validate_band_order(bands)
+    src_folder, out_path = Path(src_folder), Path(out_path)
     # 1) 为每个波段找到 tiles
     band_tiles: dict[str, list[Path]] = {}
     for b in bands:
-        files = sorted(src_folder.glob(f"{b}*.tif"))
+        files = _band_paths(src_folder, b)
         if not files:
             raise FileNotFoundError(f"Band {b} not found under {src_folder}")
         band_tiles[b] = files
@@ -250,10 +278,7 @@ def merge_bands(src_folder: Path, out_path: Path, bands: Sequence[str]) -> Path:
             )
             dst.write(dst_arr, idx)
             # 4) 写入 band 描述
-            try:
-                dst.set_band_description(idx, b)
-            except Exception:
-                pass
+            dst.set_band_description(idx, b)
 
     return out_path
 
@@ -330,6 +355,8 @@ def reproject_to_match(files: Sequence[Path | str], target_crs: str) -> List[Pat
                         dst_crs=target_crs,
                         resampling=Resampling.nearest,
                     )
+                    if src.descriptions[i - 1]:
+                        dst.set_band_description(i, src.descriptions[i - 1])
             out_files.append(dst_fp)
     return out_files
 
@@ -344,15 +371,20 @@ def merge_all_bands(
     root_dir = Path(root_dir)
     merged_dir = Path(merged_dir)
     final_path = Path(final_path)
+    bands = _validate_band_order(bands)
+
+    source_files = {band: _band_paths(root_dir, band) for band in bands}
+    if not any(source_files.values()):
+        LOGGER.warning("No band files were found under %s", root_dir)
+        return None
+    missing = [band for band, files in source_files.items() if not files]
+    if missing:
+        raise FileNotFoundError(f"Missing bands {missing} under {root_dir}")
 
     merged_dir.mkdir(parents=True, exist_ok=True)
-    band_files = {}
 
     for band in bands:
-        files = sorted(root_dir.glob(f"{band}_tile*.tif"))
-        if not files:
-            LOGGER.warning("No tiles found for band %s in %s", band, root_dir)
-            continue
+        files = source_files[band]
         print(f"🔹 合并 {band}: {len(files)} 个文件")
         
         reproj_files = reproject_to_match(files, target_crs)
@@ -370,23 +402,11 @@ def merge_all_bands(
         out_path = merged_dir / f"{band}.tif"
         with rasterio.open(out_path, "w", **out_meta) as dest:
             dest.write(mosaic[0], 1)
-        band_files[band] = out_path
+            dest.set_band_description(1, band)
 
-    if not band_files:
-        LOGGER.warning("No band files were merged under %s", root_dir)
-        return None
-
-    with rasterio.open(next(iter(band_files.values()))) as src0:
-        meta = src0.meta.copy()
-    meta.update(count=len(band_files), driver="GTiff")
-
-    final_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(final_path, "w", **meta) as dest:
-        for idx, band in enumerate(band_files, start=1):
-            with rasterio.open(band_files[band]) as src:
-                dest.write(src.read(1), idx)
-
-    return final_path
+    # Resample every band's native grid onto one reference grid and stamp the
+    # requested descriptions. Native 10/20/60 m band sizes can differ.
+    return merge_bands(merged_dir, final_path, bands)
 
 def process_download(
     project_root: Path | str,
@@ -397,6 +417,7 @@ def process_download(
     max_cloud: float = 5.0,
     log_to_file: bool = True,
 ) -> Dict[str, DownloadResult]:
+    bands_to_download = _validate_band_order(bands_to_download)
     project_root = Path(project_root)
     src_root = project_root / "1source_tif"
     merged_root = project_root / "2merged_tif"
@@ -435,7 +456,19 @@ def process_download(
             for img, idx in iter_collection_paginated(collection, page_size=page_size):
                 seen += 1
                 date_str = ee.Date(img.get("system:time_start")).format("YYYY-MM-dd_HH-mm-ss").getInfo()
-                img_src_folder = src_root / date_str
+                scene_index = img.get("system:index").getInfo()
+                raw_scene_id = str(scene_index or idx)
+                safe_scene_id = re.sub(r"[^A-Za-z0-9_-]", "_", raw_scene_id)[:80]
+                scene_digest = hashlib.sha256(raw_scene_id.encode()).hexdigest()[:12]
+                scene_id = f"{safe_scene_id}_{scene_digest}"
+                scene_name = f"{date_str}_{scene_id}"
+                bucket_key = floor_to_bucket_5min(date_str)
+                prior = daily_candidates.get(bucket_key)
+                if prior is not None and prior.path.name == f"{scene_name}.tif":
+                    # A duplicate collection record must never overwrite or
+                    # delete the same bucket candidate's retained output.
+                    continue
+                img_src_folder = src_root / scene_name
                 img_src_folder.mkdir(parents=True, exist_ok=True)
 
                 all_ok = True
@@ -448,7 +481,7 @@ def process_download(
                         all_ok = False
                         break
                 # 下载循环后
-                missing = [b for b in bands_to_download if not list(img_src_folder.glob(f"{b}*.tif"))]
+                missing = [b for b in bands_to_download if not _band_paths(img_src_folder, b)]
                 if missing:
                     print(f"  ❌ 缺失波段：{missing}，丢弃 {date_str}")
                     cleanup_path(img_src_folder)
@@ -458,7 +491,7 @@ def process_download(
                     print(f"  ⚠️ 波段不完整，跳过 {date_str}")
                     continue
 
-                merged_path = merged_root / f"{date_str}.tif"
+                merged_path = merged_root / f"{scene_name}.tif"
                 try:
                     merge_bands(img_src_folder, merged_path, bands_to_download)
                 except Exception as err:
@@ -475,7 +508,6 @@ def process_download(
                     merged_path.unlink(missing_ok=True)
                     continue
 
-                bucket_key = floor_to_bucket_5min(date_str)
                 existing = daily_candidates.get(bucket_key)
                 if existing is None or valid_ratio > existing.valid_ratio:
                     if existing:

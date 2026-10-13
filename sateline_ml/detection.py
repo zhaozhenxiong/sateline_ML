@@ -45,6 +45,7 @@ import matplotlib.colors as mcolors
 import json
 import logging
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -125,6 +126,45 @@ def _configure_logger(log_file: Optional[Path | str]) -> Optional[logging.Handle
     LOGGER.setLevel(logging.INFO)
     LOGGER.addHandler(handler)
     return handler
+
+
+def _with_scene_logging(function):
+    """Release a scene's log handler after success, early return, or failure."""
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        _ensure_stream_logger()
+        handler = _configure_logger(kwargs.get("log_file"))
+        try:
+            if handler:
+                LOGGER.info("Logging to %s", handler.baseFilename)
+            return function(*args, **kwargs)
+        finally:
+            if handler:
+                LOGGER.removeHandler(handler)
+                handler.close()
+
+    return wrapped
+
+
+def _load_compatible_plastic_model(
+    path: Optional[Path | str],
+    *,
+    input_dim: int,
+    feature_names: Sequence[str],
+    band_order: Sequence[str],
+    device: str,
+):
+    """Load an existing classifier without modifying it or changing feature order."""
+    if path is None or not Path(path).is_file():
+        raise ValueError("Plastic inference requires an existing plastic_model_path checkpoint file")
+    model, metadata = load_plastic_model(path, device=device)
+    if metadata.input_dim != input_dim:
+        raise ValueError(f"Plastic checkpoint input_dim is {metadata.input_dim}; scene features require {input_dim}")
+    if tuple(metadata.feature_names) != tuple(feature_names):
+        raise ValueError("Plastic checkpoint feature_names do not match this scene and spectral library")
+    if tuple(metadata.band_order) != tuple(band_order):
+        raise ValueError("Plastic checkpoint band_order does not match this scene")
+    return model
 
 
 def _pixel_area_from_transform(transform) -> float:
@@ -977,6 +1017,7 @@ def build_combined_map(
 
 
 # -------------------- Main pipeline --------------------
+@_with_scene_logging
 def floating_debris_detection(
     input_tif: Union[Path, str, Sequence[Path | str]],
     mask_tif: Optional[Path | str] = None,
@@ -1031,6 +1072,7 @@ def floating_debris_detection(
     plastic_model_path: Optional[Path | str] = None,
     plastic_library_csv: Optional[Path | str] = None,
     plastic_prob_thresh: float = 0.5,
+    plastic_retrain: bool = True,
     # patch采样
     tile_size: int = 256,
     stride: int = 256,
@@ -1058,14 +1100,21 @@ def floating_debris_detection(
     cap_float_pixels: Optional[int] = 150_000,
     cap_susp_pixels: Optional[int] = 150_000,
 ) -> pd.DataFrame:
+    """Detect debris with per-scene UNet training and optional plastic scoring.
 
+    ``plastic_retrain=True`` preserves the legacy adaptive plastic training;
+    ``plastic_model_path`` then names the checkpoint output. Set it to ``False``
+    to load a compatible existing checkpoint without training or overwriting it.
+    Plastic inference errors are propagated in that read-only mode.
+    """
     _require_torch()
-    _ensure_stream_logger()
+    if not plastic_retrain and plastic_library_csv is not None:
+        if not Path(plastic_library_csv).is_file():
+            raise ValueError("Plastic inference requires an existing plastic_library_csv file")
+        if plastic_model_path is None or not Path(plastic_model_path).is_file():
+            raise ValueError("Plastic inference requires an existing plastic_model_path checkpoint file")
     output_csv = Path(output_csv)
     preview_png = Path(preview_png)
-    handler = _configure_logger(log_file)
-    if handler:
-        LOGGER.info("Logging to %s", handler.baseFilename)
 
     # ----------------- 读取 AOI 矢量并投到影像 CRS -----------------
     gdf: Optional[gpd.GeoDataFrame] = None
@@ -1525,10 +1574,6 @@ def floating_debris_detection(
         visualize_results(rgb_image=rgb_preview, floating_map=floating_prob, suspended_map=suspended_prob,
                           plastic_map=None, class_map=combined_map, df=df, stats=stats, output_png=preview_png, mask=None)
         df.to_csv(output_csv, index=False, encoding="utf-8-sig")
-        if handler:
-            handler.flush()
-            LOGGER.removeHandler(handler)
-            handler.close()
         return df
 
     LOGGER.info("AOI pixels: %s | floating seeds: %s | suspended seeds: %s",
@@ -1875,45 +1920,52 @@ def floating_debris_detection(
             y_plastic = np.zeros(sel_idx.size, dtype=np.float32)
             y_plastic[:len(pos_idx)] = 1.0
 
-            model_plastic, _ = train_plastic_model(
-                X_plastic, y_plastic, epochs=400, lr=1e-3, weight_decay=5e-5,
-                device=str(dev), verbose=False, hidden=(256, 128), dropout=0.25,
-            )
-            if debug_dir is not None:
-                _save_plastic_feature_correlations_pre(
-                    debug_dir, feat_names, X_plastic, y_plastic)
-                _save_plastic_spectral_profiles_pre(
-                    debug_dir, feat_names, X_plastic, y_plastic)
+            if not plastic_retrain:
+                model_plastic = _load_compatible_plastic_model(
+                    plastic_model_path, input_dim=X_plastic.shape[1],
+                    feature_names=feat_names, band_order=band_order, device=str(dev),
+                )
+                LOGGER.info("Using existing plastic checkpoint: %s", plastic_model_path)
+            else:
+                model_plastic, _ = train_plastic_model(
+                    X_plastic, y_plastic, epochs=400, lr=1e-3, weight_decay=5e-5,
+                    device=str(dev), verbose=False, hidden=(256, 128), dropout=0.25,
+                )
+                if debug_dir is not None:
+                    _save_plastic_feature_correlations_pre(
+                        debug_dir, feat_names, X_plastic, y_plastic)
+                    _save_plastic_spectral_profiles_pre(
+                        debug_dir, feat_names, X_plastic, y_plastic)
 
-            if plastic_model_path is not None:
-                meta_obj = PlasticModelMetadata(input_dim=X_plastic.shape[1], feature_names=tuple(
-                    feat_names), band_order=tuple(band_order))
-                try:
-                    from sklearn.metrics import accuracy_score, log_loss
-                    _has_sklearn = True
-                except Exception:
-                    _has_sklearn = False
-                probs_train = predict_plastic(
-                    model_plastic, X_plastic, device=str(dev)).astype(np.float32)
-                y_true = y_plastic.astype(np.int32)
-                y_pred = (probs_train >= float(
-                    plastic_prob_thresh)).astype(np.int32)
-                if _has_sklearn:
-                    acc = float(accuracy_score(y_true, y_pred))
-                    loss = float(log_loss(y_true, np.clip(
-                        probs_train, 1e-12, 1-1e-12), labels=[0, 1]))
-                else:
-                    p = np.clip(probs_train, 1e-12, 1-1e-12)
-                    acc = float((y_true == y_pred).mean())
-                    loss = float(-np.mean(y_true*np.log(p) +
-                                 (1-y_true)*np.log(1-p)))
-                LOGGER.info(
-                    "[Plastic-ML] Accuracy: %.4f | LogLoss: %.4f", acc, loss)
-                try:
-                    save_plastic_model(plastic_model_path,
-                                       model_plastic, meta_obj)
-                except Exception as _exc:
-                    LOGGER.warning("Could not save plastic model: %s", _exc)
+                if plastic_model_path is not None:
+                    meta_obj = PlasticModelMetadata(input_dim=X_plastic.shape[1], feature_names=tuple(
+                        feat_names), band_order=tuple(band_order))
+                    try:
+                        from sklearn.metrics import accuracy_score, log_loss
+                        _has_sklearn = True
+                    except Exception:
+                        _has_sklearn = False
+                    probs_train = predict_plastic(
+                        model_plastic, X_plastic, device=str(dev)).astype(np.float32)
+                    y_true = y_plastic.astype(np.int32)
+                    y_pred = (probs_train >= float(
+                        plastic_prob_thresh)).astype(np.int32)
+                    if _has_sklearn:
+                        acc = float(accuracy_score(y_true, y_pred))
+                        loss = float(log_loss(y_true, np.clip(
+                            probs_train, 1e-12, 1-1e-12), labels=[0, 1]))
+                    else:
+                        p = np.clip(probs_train, 1e-12, 1-1e-12)
+                        acc = float((y_true == y_pred).mean())
+                        loss = float(-np.mean(y_true*np.log(p) +
+                                     (1-y_true)*np.log(1-p)))
+                    LOGGER.info(
+                        "[Plastic-ML] Accuracy: %.4f | LogLoss: %.4f", acc, loss)
+                    try:
+                        save_plastic_model(plastic_model_path,
+                                           model_plastic, meta_obj)
+                    except Exception as _exc:
+                        LOGGER.warning("Could not save plastic model: %s", _exc)
             # 预测全部候选
             pred_idx = np.where(cand_pos_mask.ravel())[0]
             pred_rows = (pred_idx // W).astype(np.int64)
@@ -1989,6 +2041,8 @@ def floating_debris_detection(
                 plastic_type_map = None
 
         except Exception as exc:
+            if not plastic_retrain:
+                raise RuntimeError(f"Requested plastic checkpoint inference failed: {exc}") from exc
             LOGGER.warning("Plastic branch failed: %s", exc)
             plastic_prob_map = None
             plastic_mask_pred = None
@@ -2155,10 +2209,6 @@ def floating_debris_detection(
         output_png=preview_png,
     )
 
-    if handler:
-        handler.flush()
-        LOGGER.removeHandler(handler)
-        handler.close()
     return df
 
 

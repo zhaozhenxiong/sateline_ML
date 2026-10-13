@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "paths": {
+    "input_dir": "mydata/tif",
+    "shapefile_dir": "mydata/shp",
+    "output_dir": "mydata/analysis_outputs"
+  },
+  "download": {
+    "enabled": false,
+    "project": null,
+    "start_date": "2022-01-01",
+    "end_date": "2022-03-01",
+    "roi_bounds": [
+      119.8,
+      30.9,
+      120.6,
+      31.6
+    ],
+    "output_root": "gee_sentinel3",
+    "step_days": 15,
+    "bands": [
+      "B2",
+      "B3",
+      "B4",
+      "B5",
+      "B8",
+      "B8A",
+      "B9",
+      "B11",
+      "B12"
+    ],
+    "scene_prefix": null,
+    "max_cloud": 5.0
+  },
+  "detection": {
+    "enabled": true,
+    "device": "auto",
+    "raster_crs_override": null,
+    "band_order": [
+      "B2",
+      "B3",
+      "B4",
+      "B5",
+      "B8",
+      "B8A",
+      "B9",
+      "B11",
+      "B12"
+    ],
+    "require_shapefile": false,
+    "plastic_library_csv": null,
+    "plastic_model_path": null,
+    "parameters": {
+      "epochs": 5,
+      "repeats": 1,
+      "val_split": 0.25,
+      "tile_size": 256,
+      "stride": 128,
+      "max_patches": 1024,
+      "min_valid_frac": 0.5,
+      "pos_frac": 0.9,
+      "patch_seed": 42,
+      "absorbance_thresh": 0.6,
+      "water_ndwi_thresh": 0.1,
+      "floating_thresh": 0.7,
+      "suspended_thresh": 0.7,
+      "auto_calibrate_thresholds": false,
+      "stacking_preset": null,
+      "stacking_sample_limit": 40000,
+      "stacking_pixel_stride": 3,
+      "stacking_max_pixels": 150000,
+      "stacking_cv_folds": 5,
+      "strict_mode": true,
+      "unc_margin": 0.1,
+      "min_area_float": 10,
+      "min_area_susp": 24,
+      "cap_float_pixels": 300000,
+      "cap_susp_pixels": 120000
+    }
+  }
+}

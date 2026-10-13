@@ -1,221 +1,171 @@
-"""
-Auto-detect and install Python dependencies used in this repository.
+"""Install declared feature dependencies without importing native libraries.
 
-Usage examples:
-  - python sateline_ML/scripts/install_deps.py                 # auto-detect and install missing
-  - python sateline_ML/scripts/install_deps.py --root sateline_ML --dry-run
-  - python sateline_ML/scripts/install_deps.py --skip-gee --torch cpu
-
-Notes:
-  - On Windows, installing geopandas/rasterio may take time and require wheels.
-    This script attempts a straightforward pip install; if it fails, consult:
-    https://www.lfd.uci.edu/~gohlke/pythonlibs/ for prebuilt wheels.
+The dependency source is pyproject.toml, never a scan of notebooks, attic, or
+virtual environments. Run inside a virtual environment on the destination host.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
+import ast
+from importlib import metadata, util
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Set, Tuple
+from typing import Iterable
 
-
-# Map import names to pip package names when they differ
-MODULE_TO_PKG: Dict[str, str] = {
-    "cv2": "opencv-python",
-    "ee": "earthengine-api",
-    "skimage": "scikit-image",
-    "sklearn": "scikit-learn",
-    "PIL": "Pillow",
+MODULES = {
+    "earthengine-api": "ee", "opencv-python-headless": "cv2",
+    "scikit-learn": "sklearn", "scikit-image": "skimage",
+    "pydensecrf": "pydensecrf",
 }
-
-# Some packages are optional by feature area
-DEFAULT_GROUPS: Dict[str, List[str]] = {
-    "base": [
-        "numpy",
-        "pandas",
-        "tqdm",
-        "matplotlib",
-        "shapely",
-        "requests",
-        "opencv-python",
-    ],
-    "geo": [
-        "rasterio",
-        "geopandas",
-    ],
-    "ml": [
-        "torch",  # CPU-only by default on Windows when installed via PyPI
-    ],
-    "gee": [
-        "earthengine-api",
-    ],
-    "heavy_ml": [
-        "lightgbm",
-        "xgboost",
-        "catboost",
-        "pydensecrf",
-    ],
-}
-
-# Packages that are only installed when --with-heavy-ml is passed
-HEAVY_ML_PKGS: Set[str] = set(DEFAULT_GROUPS["heavy_ml"])
+CPU_INDEX = "https://download.pytorch.org/whl/cpu"
 
 
-IMPORT_RE = re.compile(r"^\s*(?:from\s+([\w\.]+)\s+import|import\s+([\w\.]+))")
-
-# Standard-library top-level module names to ignore during auto-detection
-_STDLIB_MODULES: Set[str] = set(getattr(sys, "stdlib_module_names", []))
-
-
-def parse_imports(py_file: Path) -> Iterable[str]:
+def declared_groups(root: Path) -> dict[str, list[str]]:
+    path = root / "pyproject.toml"
+    source = path.read_text(encoding="utf-8")
     try:
-        for line in py_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            m = IMPORT_RE.match(line)
-            if not m:
-                continue
-            mod = m.group(1) or m.group(2)
-            if not mod:
-                continue
-            top = mod.split(".")[0]
-            if top and top != "sateline_ml" and top not in _STDLIB_MODULES:
-                yield top
-    except Exception:
-        return []
+        import tomllib
+    except ImportError:  # Python 3.10: parse only this project's string arrays.
+        section = re.search(
+            r"(?ms)^\[project\.optional-dependencies\]\s*\n(.*?)(?=^\[|\Z)", source
+        )
+        if section is None:
+            raise ValueError("pyproject.toml has no declared dependency groups")
+        groups = {
+            name: ast.literal_eval(value)
+            for name, value in re.findall(
+                r"(?ms)^([\w-]+)\s*=\s*(\[.*?\])", section.group(1)
+            )
+        }
+    else:
+        groups = tomllib.loads(source)["project"]["optional-dependencies"]
+    if not groups or any(
+        not isinstance(reqs, list) or not all(isinstance(req, str) for req in reqs)
+        for reqs in groups.values()
+    ):
+        raise ValueError("Dependency groups must contain arrays of requirement strings")
+    return groups
 
 
-def discover_modules(root: Path) -> Set[str]:
-    modules: Set[str] = set()
-    for py in root.rglob("*.py"):
-        modules.update(parse_imports(py))
-    return modules
+def package_name(requirement: str) -> str:
+    match = re.match(r"[A-Za-z0-9][A-Za-z0-9_.-]*", requirement)
+    if match is None:
+        raise ValueError(f"Invalid declared requirement: {requirement}")
+    return match.group().lower().replace("_", "-")
 
 
-def resolve_packages(modules: Iterable[str]) -> List[str]:
-    pkgs: Set[str] = set()
-    for m in modules:
-        pkg = MODULE_TO_PKG.get(m, m)
-        pkgs.add(pkg)
-    return sorted(pkgs)
+def selected_requirements(args, groups: dict[str, list[str]]) -> list[str]:
+    selected = args.group or ["all"]
+    if args.with_heavy_ml:
+        selected = [*selected, "stacking"]
+    unknown = set(selected) - groups.keys()
+    if unknown:
+        raise ValueError(f"Unknown group(s): {', '.join(sorted(unknown))}")
+    excluded = set()
+    if args.skip_geo or args.only_base:
+        excluded.update(("rasterio", "geopandas"))
+    if args.skip_gee or args.only_base:
+        excluded.add("earthengine-api")
+    if args.skip_ml or args.only_base or args.torch == "skip":
+        excluded.add("torch")
+    if args.only_base:
+        excluded.update(package_name(req) for req in groups.get("stacking", [])
+                        if package_name(req) not in {"numpy", "pandas", "opencv-python-headless"})
+    return list(dict.fromkeys(
+        req for group in selected for req in groups[group]
+        if package_name(req) not in excluded
+    ))
 
 
-def missing_packages(packages: Iterable[str]) -> List[str]:
-    missing: List[str] = []
-    for pkg in packages:
-        mod = pkg
-        # Inverse mapping for known renames
-        for k, v in MODULE_TO_PKG.items():
-            if v == pkg:
-                mod = k
-                break
+def missing_packages(requirements: Iterable[str]) -> list[str]:
+    """Report missing metadata/modules without loading native extension code.
+
+    pip still receives all selected constraints, so it handles old versions and
+    transitive dependencies even when the top-level package is already present.
+    """
+    missing = []
+    for req in requirements:
+        name = package_name(req)
+        module = MODULES.get(name, name.replace("-", "_"))
         try:
-            __import__(mod)
-        except Exception:
-            missing.append(pkg)
+            metadata.version(name)
+            found = util.find_spec(module) is not None
+        except (metadata.PackageNotFoundError, ImportError, ValueError):
+            found = False
+        if not found:
+            missing.append(req)
     return missing
 
 
-def pip_install(args: List[str]) -> int:
-    cmd = [sys.executable, "-m", "pip", "install"] + args
-    print("[pip]", " ".join(cmd))
-    return subprocess.call(cmd)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Auto-install project dependencies")
-    parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]), help="Root to scan for imports")
-    parser.add_argument("--skip-geo", action="store_true", help="Skip installing heavy geospatial deps (geopandas/rasterio)")
-    parser.add_argument("--skip-gee", action="store_true", help="Skip Google Earth Engine client")
-    parser.add_argument("--skip-ml", action="store_true", help="Skip ML deps (torch)")
-    parser.add_argument("--only-base", action="store_true", help="Install only common/base deps")
-    parser.add_argument("--torch", choices=["auto", "cpu", "skip"], default="auto", help="Torch install preference")
-    parser.add_argument("--with-heavy-ml", action="store_true", help="Install heavy optional ML packages (lightgbm, xgboost, catboost, pydensecrf)")
-    parser.add_argument("--upgrade-pip", action="store_true", help="Upgrade pip before installing")
-    parser.add_argument("--dry-run", action="store_true", help="Only print what would be installed")
-    parser.add_argument("--separate", action="store_true", help="Install packages one-by-one instead of grouped")
-    args = parser.parse_args()
-
-    root = Path(args.root)
-    if not root.exists():
-        print(f"[WARN] root not found: {root}")
-        return
-
-    # Detect modules from source
-    detected_mods = discover_modules(root)
-    detected_pkgs = resolve_packages(detected_mods)
-
-    # Start from base group, then add optional groups unless skipped
-    wanted: List[str] = []
-    wanted += DEFAULT_GROUPS["base"]
-    if not args.only_base:
-        if not args.skip_geo:
-            wanted += DEFAULT_GROUPS["geo"]
-        if not args.skip_ml and args.torch != "skip":
-            wanted += DEFAULT_GROUPS["ml"]
-        if not args.skip_gee:
-            wanted += DEFAULT_GROUPS["gee"]
-        if args.with_heavy_ml:
-            wanted += DEFAULT_GROUPS["heavy_ml"]
-
-    # Also include anything detected from code that isn't already in wanted
-    for pkg in detected_pkgs:
-        if pkg in wanted:
-            continue
-        if pkg in HEAVY_ML_PKGS and not args.with_heavy_ml:
-            continue
-        wanted.append(pkg)
-
-    # Torch handling
-    if "torch" in wanted:
-        if args.torch == "skip":
-            wanted.remove("torch")
-        elif args.torch == "cpu":
-            # Rely on PyPI CPU wheels on Windows/macOS; leave as 'torch'
-            pass
-        else:  # auto
-            pass
-
-    # Compute what is missing right now
-    to_install = missing_packages(wanted)
-
-    print("[INFO] Wanted packages:")
-    for p in sorted(set(wanted)):
-        print("  -", p)
-    print("[INFO] Missing:")
-    for p in to_install:
-        print("  -", p)
-    if not to_install:
-        print("[INFO] All dependencies already satisfied.")
-        return
-
-    if args.dry_run:
-        print("[DRY-RUN] Skipping installation.")
-        return
-
+def install_commands(args, requirements: list[str]) -> list[list[str]]:
+    prefix = [sys.executable, "-m", "pip", "install"]
+    commands = []
     if args.upgrade_pip:
-        subprocess.call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])  # best effort
-
-    # Install in groups or separately
+        commands.append([*prefix, "--upgrade", "pip"])
+    cpu_torch = args.torch == "cpu" and sys.platform.startswith(("linux", "win"))
+    torch_reqs = [req for req in requirements if package_name(req) == "torch"]
+    remaining = [req for req in requirements if not (cpu_torch and package_name(req) == "torch")]
+    if cpu_torch and torch_reqs:
+        # Reinstall explicitly: an already present CUDA wheel does not satisfy
+        # an explicit request for a CPU build on the destination machine.
+        commands.append([*prefix, "--upgrade", "--force-reinstall", *torch_reqs,
+                         "--index-url", CPU_INDEX])
     if args.separate:
-        for pkg in to_install:
-            rc = pip_install([pkg])
-            if rc != 0:
-                print(f"[ERROR] Failed to install {pkg} (rc={rc}). You may need a prebuilt wheel on Windows.")
-    else:
-        rc = pip_install(to_install)
-        if rc != 0:
-            print(f"[WARN] Group install failed (rc={rc}). Retrying one-by-one...")
-            for pkg in to_install:
-                rc1 = pip_install([pkg])
-                if rc1 != 0:
-                    print(f"[ERROR] Failed to install {pkg} (rc={rc1}).")
+        commands.extend([*prefix, req] for req in remaining)
+    elif remaining:
+        commands.append([*prefix, *remaining])
+    return commands
 
-    print("[DONE] Installation step completed.")
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1],
+                        help="Project containing pyproject.toml (no source scanning)")
+    parser.add_argument("--group", action="append", help="Declared extra to install; repeat for multiple (default: all)")
+    parser.add_argument("--skip-geo", action="store_true", help="Exclude geopandas and rasterio")
+    parser.add_argument("--skip-gee", action="store_true", help="Exclude Earth Engine")
+    parser.add_argument("--skip-ml", action="store_true", help="Exclude torch")
+    parser.add_argument("--only-base", action="store_true", help="Exclude GEE, rasterio, geopandas, torch, and stacking models")
+    parser.add_argument("--torch", choices=("auto", "cpu", "skip"), default="auto")
+    parser.add_argument("--with-heavy-ml", action="store_true", help="Include the declared stacking extra; CRF is separate")
+    parser.add_argument("--upgrade-pip", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--separate", action="store_true")
+    args = parser.parse_args(argv)
+    if sys.version_info < (3, 10):
+        print("[ERROR] sateline-ml requires Python 3.10 or later.", file=sys.stderr)
+        return 2
+    try:
+        wanted = selected_requirements(args, declared_groups(args.root))
+    except (OSError, ValueError, KeyError, SyntaxError) as exc:
+        print(f"[ERROR] Cannot read declared dependencies: {exc}", file=sys.stderr)
+        return 2
+    print("[INFO] Selected requirements:")
+    for req in wanted:
+        print(f"  - {req}")
+    missing = missing_packages(wanted)
+    print("[INFO] Missing packages:", ", ".join(missing) or "none")
+    if args.torch == "cpu" and sys.platform == "darwin" and any(package_name(r) == "torch" for r in wanted):
+        print("[INFO] macOS uses its PyPI torch wheel; select device=cpu in the pipeline config for CPU execution.")
+    commands = install_commands(args, wanted)
+    for cmd in commands:
+        print("[DRY-RUN]" if args.dry_run else "[pip]", shlex.join(cmd), flush=True)
+        if not args.dry_run:
+            try:
+                rc = subprocess.call(cmd)
+            except OSError as exc:
+                print(f"[ERROR] pip could not start: {exc}", file=sys.stderr)
+                return 1
+            if rc:
+                print(f"[ERROR] Dependency installation failed (exit {rc}).", file=sys.stderr)
+                return rc if rc > 0 else 1
+    print("[DRY-RUN] No changes made." if args.dry_run else "[DONE] Selected dependency constraints satisfied.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
+    raise SystemExit(main())

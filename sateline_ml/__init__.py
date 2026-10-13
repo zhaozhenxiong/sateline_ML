@@ -1,43 +1,46 @@
-"""sateline_ml package
+"""Sentinel-2 download and debris detection, with lazy optional dependencies.
 
-Utilities for downloading Sentinel-2 imagery from Google Earth Engine and
-detecting floating debris from multispectral imagery.
+Importing :mod:`sateline_ml` only loads the Python standard library. Install
+``sateline-ml[download]`` or ``sateline-ml[detection]`` for the corresponding API.
 """
 
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 
-from .gee import (
-    DownloadResult,
-    initialize_ee,
-    process_download,
-    find_max_size,
-    merge_all_bands,
-)
-from .detection import (
-    floating_debris_detection,
-    create_mask_tif_from_shp,
-)
-try:  # Optional stacking exports
-    from .stacking import STACKING_PRESETS, run_stacking_pipeline
-except Exception:  # pragma: no cover
-    STACKING_PRESETS = {}
-    run_stacking_pipeline = None  # type: ignore
-
 try:
-    __version__ = version("sateline_ml")
-except PackageNotFoundError:  # pragma: no cover - package metadata missing
-    __version__ = "0.0.0"
+    __version__ = version("sateline-ml")
+except PackageNotFoundError:
+    __version__ = "0.1.0"
 
-__all__ = [
-    "__version__",
-    "DownloadResult",
-    "initialize_ee",
-    "process_download",
-    "find_max_size",
-    "merge_all_bands",
-    "floating_debris_detection",
-    "create_mask_tif_from_shp",
-]
+_EXPORTS = {
+    "DownloadResult": ("gee", "download"),
+    "initialize_ee": ("gee", "download"),
+    "process_download": ("gee", "download"),
+    "find_max_size": ("gee", "download"),
+    "merge_all_bands": ("gee", "download"),
+    "floating_debris_detection": ("detection", "detection"),
+    "create_mask_tif_from_shp": ("detection", "detection"),
+    "STACKING_PRESETS": ("stacking", "stacking"),
+    "run_stacking_pipeline": ("stacking", "stacking"),
+}
+__all__ = ["__version__", *_EXPORTS]
 
-if run_stacking_pipeline is not None:
-    __all__.extend(["STACKING_PRESETS", "run_stacking_pipeline"])
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module, extra = _EXPORTS[name]
+    try:
+        value = getattr(import_module(f".{module}", __name__), name)
+    except ImportError as exc:
+        raise ImportError(
+            f"{name} requires the {extra} dependencies. "
+            f"Install with: python -m pip install 'sateline-ml[{extra}]'. "
+            f"Original import error: {exc}"
+        ) from exc
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_EXPORTS))
