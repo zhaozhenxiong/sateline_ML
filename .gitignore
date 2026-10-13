@@ -1,0 +1,72 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Virtual environments
+venv/
+.env/
+.env
+.env.*
+!.env.example
+.venv/
+env/
+
+# Packaging outputs
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# R / misc
+.Rhistory
+*.log
+.DS_Store
+._*
+
+# Large geospatial data / generated outputs
+1source_tif/
+2merged_tif/
+export_tifs_from_merged/
+outputs/
+mydata/
+gee_sentinel3/
+gee_nature3/
+target/
+target_merge/
+target_n/
+lake_01-05/
+HydroLAKES_polys_v10.gdb/
+HydroLAKES_polys_v10_shp/
+shplist/
+sp/
+plastic_back/
+target_lake_info.xlsx
+
+# Large binaries / model weights / imagery
+*.tif
+*.tiff
+*.TIF
+*.TIFF
+*.gdb
+*.gdb.zip
+*.pt
+*.pth
+models
+*.csv
+
+# Keep small reference data
+!plastic_library.csv
+!hybas_lake_as_lev06_v1c.csv
+!spectral_library/plastic_spectra.csv
